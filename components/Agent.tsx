@@ -5,9 +5,9 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
 import { cn } from "@/lib/utils";
-import { vapi } from "@/lib/vapi.sdk";
-import { interviewer } from "@/constants";
+import { vapi, assistant } from "@/lib/vapi.sdk";
 import { createFeedback } from "@/lib/actions/general.action";
+import { checkUserUsage, incrementUserUsage } from "@/lib/actions/usage.action";
 
 enum CallStatus {
   INACTIVE = "INACTIVE",
@@ -34,6 +34,7 @@ const Agent = ({
   const [messages, setMessages] = useState<SavedMessage[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [lastMessage, setLastMessage] = useState<string>("");
+  const [usageError, setUsageError] = useState<string>("");
 
   useEffect(() => {
     const onCallStart = () => {
@@ -62,7 +63,8 @@ const Agent = ({
     };
 
     const onError = (error: Error) => {
-      console.log("Error:", error);
+      console.error("VAPI Error:", error);
+      setCallStatus(CallStatus.INACTIVE);
     };
 
     vapi.on("call-start", onCallStart);
@@ -90,6 +92,11 @@ const Agent = ({
     const handleGenerateFeedback = async (messages: SavedMessage[]) => {
       console.log("handleGenerateFeedback");
 
+      // Increment usage after successful interview
+      if (type === "interview") {
+        await incrementUserUsage(userId!);
+      }
+
       const { success, feedbackId: id } = await createFeedback({
         interviewId: interviewId!,
         userId: userId!,
@@ -115,28 +122,63 @@ const Agent = ({
   }, [messages, callStatus, feedbackId, interviewId, router, type, userId]);
 
   const handleCall = async () => {
-    setCallStatus(CallStatus.CONNECTING);
-
-    if (type === "generate") {
-      await vapi.start(process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID!, {
-        variableValues: {
-          username: userName,
-          userid: userId,
-        },
-      });
-    } else {
-      let formattedQuestions = "";
-      if (questions) {
-        formattedQuestions = questions
-          .map((question) => `- ${question}`)
-          .join("\n");
+    try {
+      // Check usage before starting the call (only for interview type)
+      if (type === "interview") {
+        const usage = await checkUserUsage(userId!);
+        if (!usage.canUse) {
+          setUsageError(
+            "You have reached your interview limit. Each user can only take one interview."
+          );
+          return;
+        }
       }
 
-      await vapi.start(interviewer, {
-        variableValues: {
-          questions: formattedQuestions,
-        },
+      setCallStatus(CallStatus.CONNECTING);
+      console.log("Starting call...");
+
+      if (type === "generate") {
+        const workflowId = process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID;
+        if (!workflowId) {
+          throw new Error("Workflow ID is not configured");
+        }
+        console.log("Using workflow:", workflowId);
+
+        await vapi.start(workflowId, {
+          variableValues: {
+            username: userName,
+            userid: userId,
+          },
+        });
+      } else {
+        if (!assistant) {
+          throw new Error("Assistant ID is not configured");
+        }
+        console.log("Using assistant:", assistant);
+
+        // Format questions for the assistant
+        let formattedQuestions = "";
+        if (questions) {
+          formattedQuestions = questions
+            .map((question) => `- ${question}`)
+            .join("\n");
+        }
+
+        // Start the call with the assistant directly
+        await vapi.start(assistant, {
+          variableValues: {
+            questions: formattedQuestions,
+          },
+        });
+      }
+    } catch (error) {
+      console.error("Error details:", {
+        error,
+        type,
+        workflowId: process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID,
+        assistantId: assistant,
       });
+      setCallStatus(CallStatus.INACTIVE);
     }
   };
 
@@ -213,6 +255,30 @@ const Agent = ({
         ) : (
           <button className="btn-disconnect" onClick={() => handleDisconnect()}>
             End
+          </button>
+        )}
+      </div>
+
+      {/* Call Controls */}
+      <div className="call-controls">
+        {usageError && (
+          <div className="text-red-500 mb-4 text-center">{usageError}</div>
+        )}
+        {callStatus === CallStatus.INACTIVE && (
+          <button
+            onClick={handleCall}
+            className={cn("connect-btn", {
+              "opacity-50 cursor-not-allowed": !!usageError,
+            })}
+            disabled={!!usageError}
+          >
+            Connect
+          </button>
+        )}
+        {(callStatus === CallStatus.CONNECTING ||
+          callStatus === CallStatus.ACTIVE) && (
+          <button onClick={handleDisconnect} className="disconnect-btn">
+            Disconnect
           </button>
         )}
       </div>
