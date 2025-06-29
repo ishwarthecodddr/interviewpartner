@@ -7,6 +7,11 @@ import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { vapi } from "@/lib/vapi.sdk";
 import { createFeedback } from "@/lib/actions/general.action";
+import { checkUserUsage, incrementUserUsage } from "@/lib/actions/usage.action";
+
+// Importing from environment variables
+const WORKFLOW_ID = process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID;
+const ASSISTANT_ID = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID;
 
 enum CallStatus {
   INACTIVE = "INACTIVE",
@@ -33,6 +38,8 @@ const Agent = ({
   const [messages, setMessages] = useState<SavedMessage[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [lastMessage, setLastMessage] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
     const onCallStart = () => {
@@ -88,19 +95,32 @@ const Agent = ({
     }
 
     const handleGenerateFeedback = async (messages: SavedMessage[]) => {
-      console.log("handleGenerateFeedback");
+      try {
+        console.log("handleGenerateFeedback");
 
-      const { success, feedbackId: id } = await createFeedback({
-        interviewId: interviewId!,
-        userId: userId!,
-        transcript: messages,
-        feedbackId,
-      });
+        // Only increment usage for interview type
+        if (type === "interview" && userId) {
+          const success = await incrementUserUsage(userId);
+          if (!success) {
+            console.error("Failed to increment usage");
+          }
+        }
 
-      if (success && id) {
-        router.push(`/interview/${interviewId}/feedback`);
-      } else {
-        console.log("Error saving feedback");
+        const { success, feedbackId: id } = await createFeedback({
+          interviewId: interviewId!,
+          userId: userId!,
+          transcript: messages,
+          feedbackId,
+        });
+
+        if (success && id) {
+          router.push(`/interview/${interviewId}/feedback`);
+        } else {
+          throw new Error("Failed to save feedback");
+        }
+      } catch (error) {
+        console.error("Error in handleGenerateFeedback:", error);
+        setError("Failed to save feedback");
         router.push("/");
       }
     };
@@ -116,40 +136,50 @@ const Agent = ({
 
   const handleCall = async () => {
     try {
+      setError("");
+      setIsLoading(true);
+
+      // Check usage for interview type
+      if (type === "interview" && userId) {
+        const usage = await checkUserUsage(userId);
+        if (!usage.canUse) {
+          setError("You have reached your interview limit. Each user can only take one interview.");
+          setIsLoading(false);
+          return;
+        }
+      }
+
       setCallStatus(CallStatus.CONNECTING);
       console.log("Starting call...");
 
       if (type === "generate") {
-        const workflowId = process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID;
-        if (!workflowId) {
+        if (!WORKFLOW_ID) {
           throw new Error("Workflow ID is not configured");
         }
-        console.log("Using workflow:", workflowId);
+        console.log("Using workflow:", WORKFLOW_ID);
 
-        await vapi.start(workflowId, {
+        await vapi.start(WORKFLOW_ID, {
           variableValues: {
             username: userName,
             userid: userId,
           },
         });
       } else {
-        if (!assistant) {
+        if (!ASSISTANT_ID) {
           throw new Error("Assistant ID is not configured");
         }
-        console.log("Using assistant:", assistant);
+        console.log("Using assistant:", ASSISTANT_ID);
 
         // Format questions for the assistant
-        let formattedQuestions = "";
-        if (questions) {
-          formattedQuestions = questions
-            .map((question) => `- ${question}`)
-            .join("\n");
-        }
+        const formattedQuestions = questions ? questions.map((q) => `- ${q}`).join("\n") : "";
 
-        // Start the call with the assistant directly
-        await vapi.start(assistant, {
+        // Start the call with the assistant
+        await vapi.start(WORKFLOW_ID!, {
           variableValues: {
+            username: userName,
+            userid: userId,
             questions: formattedQuestions,
+            assistantId: ASSISTANT_ID,
           },
         });
       }
@@ -157,10 +187,13 @@ const Agent = ({
       console.error("Error details:", {
         error,
         type,
-        workflowId: process.env.NEXT_PUBLIC_VAPI_WORKFLOW_ID,
-        assistantId: assistant,
+        workflowId: WORKFLOW_ID,
+        assistantId: ASSISTANT_ID,
       });
+      setError(error instanceof Error ? error.message : "Failed to start the call");
       setCallStatus(CallStatus.INACTIVE);
+    } finally {
+      setIsLoading(false);
     }
   };
 
